@@ -1,7 +1,7 @@
 import base64
 import os
-import subprocess
 from io import BytesIO
+from tempfile import NamedTemporaryFile
 
 import requests
 from dotenv import load_dotenv
@@ -16,6 +16,7 @@ from fastapi import UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.responses import RedirectResponse
 from pydub import AudioSegment
+from pydub.utils import which
 
 load_dotenv()
 
@@ -74,25 +75,9 @@ async def is_authenticated(request: Request):
     )
 
 
-# Convert WMA to WAV if necessary
-def convert_to_wav(input_path, output_path):
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        input_path,
-        "-ar",
-        "16000",
-        "-ac",
-        "1",
-        output_path,
-    ]
-    subprocess.run(cmd, check=True)
-
-
 # Prepare payload for API call
-def _prepare_payload(audio_path):
-    audio = AudioSegment.from_file(audio_path, format="wav")
+def _prepare_payload(audio_bytes):
+    audio = AudioSegment.from_file(BytesIO(audio_bytes), format="wav")
     buffered = BytesIO()
     audio.export(buffered, format="wav")
     encoded_audio = base64.b64encode(buffered.getvalue()).decode("utf-8")
@@ -135,38 +120,64 @@ async def upload_file(
     file: UploadFile = File(...),
     authenticated: bool = Depends(is_authenticated),
 ):
-    input_path = f"./assets/{file.filename}"
-    output_path = "./assets/sample.wav"
+    # Explicitly set ffmpeg and ffprobe path for pydub
+    AudioSegment.converter = which("ffmpeg")
+    AudioSegment.ffprobe = which("ffprobe")
 
-    # Save uploaded file
-    with open(input_path, "wb") as f:
-        f.write(await file.read())
+    # Save uploaded file temporarily
+    with (
+        NamedTemporaryFile(delete=False, suffix=".wma") as temp_input,
+        NamedTemporaryFile(delete=False, suffix=".wav") as temp_output,
+    ):
+        try:
+            # Write uploaded WMA file
+            temp_input.write(await file.read())
+            temp_input.flush()
+            temp_input_path = temp_input.name
+            temp_output_path = temp_output.name
 
-    # Convert to WAV
-    convert_to_wav(input_path, output_path)
+            # Log paths for debugging
+            print(f"Temp input: {temp_input_path}")
+            print(f"Temp output: {temp_output_path}")
 
-    # Process audio
-    payload = _prepare_payload(output_path)
-    result = remote_pipeline(payload)
-    transcription = result.get("text", "Error: No transcription available")
+            # Convert WMA to WAV using ffmpeg
+            audio = AudioSegment.from_file(temp_input_path)
+            audio.export(temp_output_path, format="wav")
 
-    return HTMLResponse(
-        content=f"""
-    <!doctype html>
-    <html>
-        <head>
-            <title>Transcription Result</title>
-        </head>
-        <body>
-            <h1>Transcription Result</h1>
-            <textarea rows="10" cols="50">{transcription}</textarea>
-            <br>
-            <a href="/">Upload another file</a>
-        </body>
-    </html>
-    """,
-        status_code=200,
-    )
+            # Read the converted WAV bytes
+            with open(temp_output_path, "rb") as f:
+                wav_bytes = f.read()
+
+            # Process the audio file
+            payload = _prepare_payload(wav_bytes)
+            result = remote_pipeline(payload)
+            transcription = result.get(
+                "text", "Error: No transcription available"
+            )
+
+            # Return transcription result
+            return HTMLResponse(
+                content=f"""
+            <!doctype html>
+            <html>
+                <head>
+                    <title>Transcription Result</title>
+                </head>
+                <body>
+                    <h1>Transcription Result</h1>
+                    <textarea rows="10" cols="50">{transcription}</textarea>
+                    <br>
+                    <a href="/">Upload another file</a>
+                </body>
+            </html>
+            """,
+                status_code=200,
+            )
+
+        finally:
+            # Ensure temporary files are deleted
+            os.remove(temp_input_path)
+            os.remove(temp_output_path)
 
 
 @app.get("/logout")
